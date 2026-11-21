@@ -1,0 +1,202 @@
+QUALIFICATION CONTRACT
+Owner-side qualification tooling: evidence-bundle packager and verifier.
+Python 3 standard library only. Ordinary defensive code: no root, no
+mounts, no environment or sandbox mechanics. ctypes is used solely for
+the renameat2 no-overwrite syscall.
+
+COMPONENTS
+- packager.py (producer): builds an evidence bundle - a directory of
+  evidence files plus manifest.json - and publishes it. The producer
+  emits evidence and a manifest only. It never emits a verdict.
+- verifier.py (consumer): validates a published bundle and emits the
+  verdict. Only the verifier emits verdicts. A verdict exists only after
+  complete validation of the exact bundle it names, and it binds the
+  manifest-DECLARED bundle name, the bundle's absolute path, and the
+  bundle's manifest sha256. A verdict for an absent, moved, renamed, or
+  changed bundle is invalid on its face. The absolute path is the
+  lexically normalized one (as os.path.abspath forms it), and it is
+  the path checked and read; the packager publishes into the
+  normalized OUT_PARENT it reports.
+- checks.py (gate): 16 checks over the packager and verifier, using real
+  mechanisms only: real SIGKILLs of a real subprocess, a real OS write
+  error, and a real second filesystem for the cross-device case.
+
+GUARANTEES
+- Atomic visibility. The published path appears only through one atomic
+  renameat2(RENAME_NOREPLACE) on Linux/x86-64 in a 64-bit process
+  (pointer-size guard included). Before that rename, nothing partial
+  exists at the published path. After it, the bundle is complete and
+  valid; a kill after publish may leave a complete bundle - stated, not
+  hidden.
+- Fail-closed platform guard. Any other platform, architecture, process
+  width, or a kernel without renameat2 refuses to publish. There is no
+  racy check-then-rename fallback.
+- No overwrite. An existing target is never replaced. The guarantee
+  rests on renameat2(RENAME_NOREPLACE) syscall semantics.
+- Live staging namespace is locked for cooperating participants. The
+  packager creates a reservation directory outside the staging namespace
+  and valid bundle names, locks it with flock, verifies its identity,
+  then renames it without overwrite into the staging namespace. Every
+  staging directory this version creates is therefore locked from the
+  moment it has a staging name through the publish rename. A cooperating
+  sweep skips and reports staging it cannot lock. Reservations are
+  reported as skipped and never swept. If a pack dies before the staging
+  rename, its reservation remains until an operator removes it knowing
+  no pack is using it. Death after that rename releases the lock, leaving
+  staging residue sweepable. Earlier producers retain their creation-to-
+  lock gap, including with a new sweep. flock is advisory; non-cooperating
+  processes and concurrent hostile namespace replacement are outside
+  this guarantee. Sweep results list removed and skipped entries; a
+  skipped entry is not proof that an attempted removal left it untouched.
+- Fail-closed consumption. Absent, missing, incomplete, mismatched, or
+  unknown-framing bundles are invalid. Only the exact published
+  directory validates: a bundle path that is a symlink, or a directory
+  whose name is not the valid bundle name its manifest declares, is
+  invalid, so unpublished staging, a copy under another name and a
+  renamed bundle never validate. Every manifest field has an exact type:
+  version is the integer 1, bundle a valid bundle name, created a
+  timezone-aware ISO timestamp string, and files a non-empty map whose
+  entries hold exactly sha256 (64 lowercase hex) and size (a
+  non-negative integer); any other key is unknown framing. manifest.json
+  must be a regular file. Every entry in the bundle is accounted for: a
+  symlink, an unreadable directory or file, an unlisted file or an
+  empty directory makes the bundle invalid, never a crash. Stale
+  verdicts (changed evidence) and foreign verdicts (different bundle)
+  are rejected against the current bytes and identity. An evidence
+  file named manifest.json is refused as input (reserved-name
+  collision). So is evidence that cannot
+  be packed whole: a symlinked file or directory, any other non-regular
+  entry, a directory that cannot be read, or an empty directory, which
+  the manifest cannot carry; nothing under the evidence
+  directory is skipped. Abusive bundle names are
+  rejected before any staging is created. Staging on a different
+  filesystem than the publish target is rejected before any evidence
+  content is written.
+
+PER-ATTEMPT STAGING LIFECYCLE
+- Validate and collect evidence paths before allocating staging. Collection
+  is not a snapshot: an entry edited in place is read as it is at copy
+  time, and later reads and writes may still fail. An entry replaced after
+  collection - swapped for a symlink or renamed into place - is a
+  different file and is refused, with nothing published.
+- After allocation returns the held staging lock, an Exception before
+  publication attempts removal only of this attempt's unpublished staging.
+  Keep the lock held and refuse deletion if named/held identity differs,
+  the name is a symlink or inspection fails. No permissions change, input
+  deletion, reservation sweep or scan of old staging is added. Allocation
+  failures before ownership transfers remain outside this cleanup path.
+- Keep the original pack error even if cleanup, diagnostics or closing the
+  lock fails. Report ordinary cleanup failures when stderr permits it;
+  attempted recursive deletion may partly change the remaining directory.
+  If removal succeeds, partial files are no longer available to inspect.
+- Successful publication is never rolled back by cleanup. The existing
+  post-publish parent-fsync warning remains a warning, not a failed pack.
+- Only Exception subclasses trigger the new deletion attempt, not
+  KeyboardInterrupt (default Ctrl+C) or SystemExit. No signal handlers are
+  added: default SIGTERM terminates without this cleanup; SIGKILL cannot
+  be caught. A further interrupt can interrupt cleanup itself. Crashes,
+  power loss, blocked removal and earlier leftovers still need explicit
+  manual recovery. Existing advisory/cooperating-participant and hostile
+  namespace limits apply; identity inspection then path-based removal is
+  not an adversarial path-replacement guarantee.
+
+NON-CLAIMS
+- No power-loss durability proof.
+- Staging cleanup on interruption is not guaranteed. The guarantee is
+  inverted: unpublished staging can never masquerade as complete,
+  because only the exact published path with a complete manifest is
+  trusted.
+- Verdicts are not signatures and do not prove authorship or
+  authenticity.
+- The gate qualifies packager/verifier behavior only. It certifies
+  nothing about any other system, suite, or property.
+
+USAGE
+    python3 checks.py
+    python3 packager.py EVIDENCE_DIR OUT_PARENT BUNDLE_NAME
+    python3 packager.py --recover-sweep OUT_PARENT
+    python3 verifier.py BUNDLE_PATH
+    python3 verifier.py --check-verdict BUNDLE_PATH VERDICT_PATH
+
+CHECK DEFINITIONS (what the gate's 16 checks verify)
+- F1: pack publishes a complete bundle; producer output carries no
+  verdict.
+- F2: a verdict binds the bundle identity and the manifest sha256.
+- F3: republishing over an existing bundle is refused; the existing
+  bundle is untouched.
+- F4: no-overwrite race - an empty target appearing mid-run is never
+  replaced, with a control showing plain rename would replace it. The
+  full no-overwrite guarantee rests on syscall semantics, not on this
+  empirical window.
+- C1-a: a real SIGKILL mid-stage produces no publish and no verdict;
+  the residue is rejected.
+- C1-b: a real OS write error abandons the run before publish with a
+  nonzero exit and no verdict.
+- C1-c: real SIGKILLs at every point leave nothing partial before the
+  rename and a complete bundle after.
+- C1-d: path-abuse bundle names are rejected before staging.
+- C1-e: cross-filesystem staging is rejected on a real second
+  filesystem.
+- C1-f: the consumer fails closed on absent, missing, incomplete,
+  mismatched, unknown-framing and malformed-field bundles, on complete
+  staging left by a real after-manifest SIGKILL, a renamed copy and a symlinked
+  bundle path, and on an extra symlinked directory, a symlinked manifest
+  and an unreadable directory; each case is decided by its own reason.
+- C1-g: stale and foreign verdicts are rejected against current bytes
+  and identity; a fresh verdict is accepted.
+- C1-h: an evidence file named manifest.json, a symlinked evidence
+  directory and an unreadable evidence directory are each rejected as
+  input with nothing published; the staging residue holds no evidence.
+- C2-a: producer fixtures carry evidence fields only; no verdict field
+  exists anywhere in the producer schema.
+- C3-a: a sweep during a pack skips the live locked staging and the
+  pack publishes a complete VALID bundle.
+- C3-b: symlinked staging is skipped and reported skipped, never
+  removed or claimed as removed.
+- C3-c: a sweep on a missing OUT_PARENT refuses cleanly.
+
+QUALIFICATION RUNS
+November 17, 2026: the 16-check gate passed 16 of 16 on the sources of
+this change via bare `python3 checks.py` startup from the repository
+root, using CPython 3.10.12 on unprivileged Linux x86-64. The same
+tree passed ruff check, ruff format --check (13 files), mypy (6 source
+files) and the 51 staging-regression unit tests, including the ten
+regressions added with this change: on the previous sources eight
+fail behaviorally and two error only because the anchoring mechanism
+does not exist there; all ten pass on these sources.
+
+November 14, 2026: the 16-check gate passed 16 of 16 on the sources of
+that date via bare `python3 checks.py` startup from the repository root,
+using CPython 3.10.12 on unprivileged Linux x86-64. The same run
+passed ruff check, ruff format --check (13 files), mypy (6 source
+files) and the 10 staging-regression unit tests. These sources are the
+fourteen-issue batch merged through pull requests #23 to #31.
+
+November 12, 2026: the 16-check gate passed 16 of 16 on the sources of
+that date via bare `python3 checks.py` startup from the repository root
+and from a foreign working directory, using CPython 3.10.12 on
+unprivileged Linux x86-64.
+
+November 10, 2026 (accepted run, historical): the 16-check gate passed
+on the sources of that date, using CPython 3.10.12 on unprivileged
+Linux x86-64. The accepted run called the unchanged checks.main()
+after setting TMPDIR and assigning the checks module's SECOND_FS to
+fresh owned directories on actual different filesystems. This differs
+from bare command startup. Every registered check, assertion and the
+gate's failure loop remained unchanged. Both owned roots were observed
+empty afterward. The gate still continues after an individual failure;
+its nested subprocess output capture has no hard memory bound. The
+exact bytes of that run are recorded in docs/qualification-evidence.md.
+
+- CI qualification: on each pull request and push to main, all 16 checks
+  run on GitHub-hosted runners; nothing is excluded. The gate refuses to
+  run with assertions disabled (python -O / PYTHONOPTIMIZE): exit 2, no
+  PASS claimed.
+
+Re-qualify with python3 checks.py in a safe owned environment, or the
+explicitly accepted scoped-directory invocation above. After any edit
+to the tool files, rerun the gate. Do not sweep
+a shared second-filesystem namespace merely to reproduce this command.
+See qualification-evidence.md for the evidence limits of the November 10
+accepted run; it is a dated record - several defects it lists are fixed
+since - not a list of current defects.

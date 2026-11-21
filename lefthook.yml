@@ -1,0 +1,12 @@
+glob_matcher: doublestar
+pre-commit:
+  commands:
+    python-lint:
+      glob: "**/*.py"
+      run: ruff check -- {staged_files}
+    python-format:
+      glob: "**/*.py"
+      run: ruff format --check -- {staged_files}
+    python-types:
+      # Whole project, once per commit: mypy reads its file list from mypy.ini.
+      run: mypy
