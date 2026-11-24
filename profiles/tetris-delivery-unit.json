@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "repo": "tetris-js",
+  "check": "delivery-unit",
+  "scope": "Delivery unit checks only. No release, browser or whole-game verdict.",
+  "argv": [
+    "npm",
+    "run",
+    "test:delivery:unit"
+  ],
+  "artifacts": []
+}

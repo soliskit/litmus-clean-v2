@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "repo": "salutant",
+  "check": "source-tests",
+  "scope": "Existing source suite including its own coverage thresholds. No WebKit or mutation verdict.",
+  "argv": [
+    "npm",
+    "test"
+  ],
+  "artifacts": []
+}

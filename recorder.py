@@ -56,6 +56,8 @@ import time
 from datetime import datetime, timezone
 from typing import TypedDict
 
+from local_mirror import LocalMirror
+
 RECEIPT_VERSION = 1
 RECEIPT_FIELDS = {
     "version",
@@ -223,6 +225,7 @@ def record(
     cwd: str,
     timeout_seconds: float | None,
     commit_override: str | None,
+    live_output: LocalMirror | None = None,
 ) -> Receipt:
     """Run argv once and publish the pair by two atomic no-overwrite
     hard links, log first then receipt. Returns the receipt dict.
@@ -274,7 +277,33 @@ def record(
         try:
             signal.pthread_sigmask(signal.SIG_SETMASK, mask)
             try:
-                rc = proc.wait(timeout=timeout_seconds)
+                if live_output is None:
+                    rc = proc.wait(timeout=timeout_seconds)
+                else:
+                    deadline = (
+                        None
+                        if timeout_seconds is None
+                        else time.monotonic() + timeout_seconds
+                    )
+                    while proc.poll() is None:
+                        remaining = (
+                            None if deadline is None else deadline - time.monotonic()
+                        )
+                        if remaining is not None and remaining <= 0:
+                            raise subprocess.TimeoutExpired(
+                                argv, timeout_seconds or 0.0
+                            )
+                        live_output.drain(staged_log)
+                        try:
+                            proc.wait(
+                                timeout=0.02
+                                if remaining is None
+                                else min(0.02, remaining)
+                            )
+                        except subprocess.TimeoutExpired:
+                            pass
+                    rc = proc.returncode
+                    live_output.finish(staged_log)
             except subprocess.TimeoutExpired:
                 timed_out = True
                 _kill_group(proc.pid)

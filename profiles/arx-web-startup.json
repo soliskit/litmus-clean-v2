@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "repo": "Arx",
+  "check": "web-startup",
+  "scope": "Browser startup unit tests only. No native build, browser proof or Safari verdict.",
+  "argv": [
+    "node",
+    "--test",
+    "scripts/browser-startup.test.mjs"
+  ],
+  "artifacts": []
+}

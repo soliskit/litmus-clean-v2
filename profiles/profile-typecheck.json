@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "repo": "profile",
+  "check": "typecheck",
+  "scope": "Type checks only. No Next build or browser verdict.",
+  "argv": [
+    "npm",
+    "run",
+    "typecheck"
+  ],
+  "artifacts": []
+}

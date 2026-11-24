@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "repo": "soliskit.github.io",
+  "check": "unit",
+  "scope": "Website unit suite only. No Tetris qualification or deployment verdict.",
+  "argv": [
+    "npm",
+    "test"
+  ],
+  "artifacts": []
+}

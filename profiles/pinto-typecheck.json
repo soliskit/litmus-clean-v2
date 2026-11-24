@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "repo": "pinto",
+  "check": "typecheck",
+  "scope": "Type checks only. No browser, unit or mutation verdict.",
+  "argv": [
+    "npm",
+    "run",
+    "typecheck"
+  ],
+  "artifacts": []
+}

@@ -188,3 +188,21 @@ that date via bare `python3 recorder-checks.py` startup, using CPython
 
 Re-qualify with: python3 recorder-checks.py (10 checks; exit 0 means all
 pass). After any edit to the tool files, re-run the gate.
+
+OPTIONAL LOCAL LIVE MIRROR (new implementation, Linux qualification pending review)
+The Python record function accepts an optional LocalMirror object, default None.
+The recorder CLI and receipt version/fields do not change. With None the original
+proc.wait path remains. The caller opens and closes its mirror in a finally block.
+The diagnostic CLI supplies only an independently opened owner-matching FIFO,
+never an inherited descriptor, tty, regular output file, PTY or extra supervisor.
+The optional polling deadline starts on entry to the wait phase, as the ordinary
+proc.wait timeout does, not at pre-launch runtime measurement. Each live polling
+iteration performs one at-most16KiB read and one nonblocking FIFO write. Final
+best-effort drain observes a fixed EOF and stops at1MiB or10ms without waiting.
+These are implementation budgets, not user limits or real-time guarantees.
+Mirror failure/backpressure drops live bytes but never edits authoritative output
+or relabels the child result. Frozen log/receipt publication and process-group
+interrupt/timeout handling remain authoritative. Mirror completeness is reported
+outside receipt v1. GitHub Actions environment refusal prevents accidental raw
+CI mirroring; it is not a security boundary against adversarial environments.
+No macOS support claim until platform qualification.
