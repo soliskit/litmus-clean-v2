@@ -35,6 +35,10 @@ v1. It carries no signature, app qualification or root-cause verdict.
 - attachments: ordered explicit source paths; captured entries name fixed
   local payload files plus SHA256/bytes. Unavailable entries do not invent
   payloads. The verifier checks the profile's entire attachment census.
+  A declared artifact that already exists at launch and is the same file,
+  byte-for-byte, afterwards was not produced by this run: it is unavailable
+  with reason unchanged_since_launch. This is staleness detection only; a
+  command that rewrites or touches the file is captured as usual.
 - claims: fixed statement limiting the result to one selected check.
 - session_write_failed: returned in memory only if final session publication
   fails. No completed on-disk session is claimed.
@@ -49,6 +53,10 @@ These are initial conservative limits, not measured repo budgets. Recorder log
 size is not bounded by attachment limits.
 
 Verification rehashes receipt/profile/log/payloads and reconciles argv, outcome,
-labels, scope and complete census. It is not a public export, safety approval,
-source authenticity check or substitute for the bundle verifier. There is no
+labels, scope and complete census. It re-derives the fixed claims statement, the
+source observation shape and observed_clean_checkout_unchanged, requires typed
+outcome and byte fields, and rejects an in-memory session_write_failed flag or
+complete evidence without a final source observation. It is not a public
+export, safety approval, source authenticity check or substitute for the
+bundle verifier. There is no
 upload, telemetry, environment dump or hosted output in this interface.

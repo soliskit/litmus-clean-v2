@@ -23,6 +23,10 @@ from local_mirror import LocalMirror
 
 PROFILE_FIELDS = {"version", "repo", "check", "scope", "argv", "artifacts"}
 MAX_PROFILE_BYTES = 65536
+# session.json and receipt.json are generated, not caller-sized: a profile can be
+# 64 KiB and the receipt repeats its argv with indentation, so they need headroom.
+MAX_RECORD_BYTES = 1024 * 1024
+CLAIMS = "One selected check only. No whole-repo or root-cause verdict."
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
 MAX_TOTAL_BYTES = 32 * 1024 * 1024
 MAX_ARTIFACTS = 32
@@ -93,7 +97,14 @@ def regular_bytes(path: Path, limit: int) -> bytes:
     return data
 
 
-def artifact_bytes(root: Path, relative: str) -> bytes:
+Stamp = tuple[int, int, int, int, int]
+
+
+def _stamp(info: os.stat_result) -> Stamp:
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
+def _open_anchored(root: Path, relative: str) -> int:
     """Anchor every path component to an opened directory, never a link."""
     directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
@@ -104,39 +115,42 @@ def artifact_bytes(root: Path, relative: str) -> bytes:
             )
             os.close(directory)
             directory = child
-        descriptor = os.open(
+        return os.open(
             parts[-1],
             os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
             dir_fd=directory,
         )
-        with os.fdopen(descriptor, "rb") as stream:
-            before = os.fstat(stream.fileno())
-            if not stat.S_ISREG(before.st_mode) or before.st_size > MAX_ARTIFACT_BYTES:
-                raise ValueError("artifact is not a bounded regular file")
-            data = stream.read(MAX_ARTIFACT_BYTES + 1)
-            after = os.fstat(stream.fileno())
-        if (
-            len(data) != before.st_size
-            or len(data) > MAX_ARTIFACT_BYTES
-            or (
-                before.st_dev,
-                before.st_ino,
-                before.st_size,
-                before.st_mtime_ns,
-                before.st_ctime_ns,
-            )
-            != (
-                after.st_dev,
-                after.st_ino,
-                after.st_size,
-                after.st_mtime_ns,
-                after.st_ctime_ns,
-            )
-        ):
-            raise ValueError("artifact changed while reading")
-        return data
     finally:
         os.close(directory)
+
+
+def artifact_stamp(root: Path, relative: str) -> Stamp | None:
+    """Identity of an artifact before launch, or None when it does not exist."""
+    try:
+        descriptor = _open_anchored(root, relative)
+    except OSError:
+        return None
+    try:
+        return _stamp(os.fstat(descriptor))
+    finally:
+        os.close(descriptor)
+
+
+def artifact_bytes(root: Path, relative: str) -> tuple[bytes, Stamp]:
+    """Read one stable regular file; return its bytes and observed identity."""
+    with os.fdopen(_open_anchored(root, relative), "rb") as stream:
+        before = os.fstat(stream.fileno())
+        if not stat.S_ISREG(before.st_mode) or before.st_size > MAX_ARTIFACT_BYTES:
+            raise ValueError("artifact is not a bounded regular file")
+        data = stream.read(MAX_ARTIFACT_BYTES + 1)
+        after = os.fstat(stream.fileno())
+    if (
+        len(data) != before.st_size
+        or len(data) > MAX_ARTIFACT_BYTES
+        or _stamp(before) != _stamp(after)
+    ):
+        raise ValueError("artifact changed while reading")
+    return data, _stamp(after)
 
 
 def write_new(path: Path, data: bytes) -> None:
@@ -163,6 +177,16 @@ def command_status(receipt: dict[str, Any]) -> int:
     if type(signum) is int:
         return 128 + signum
     raise ValueError("invalid command outcome")
+
+
+def observed_unchanged(before: Any, after: Any, receipt: dict[str, Any]) -> bool:
+    """Derived clean-checkout flag, recomputed by the verifier, never trusted."""
+    return bool(
+        before == after
+        and before["worktree_clean"] is True
+        and receipt["commit"] == before["commit"]
+        and receipt["worktree_clean"] is True
+    )
 
 
 def ci_context(environment: dict[str, str]) -> dict[str, str] | None:
@@ -224,6 +248,9 @@ def run(
     if not cwd.is_dir():
         raise ValueError("cwd must be a directory")
     source_before = git_identity(cwd)
+    # A declared artifact that already exists before launch and is byte-for-byte
+    # the same file afterwards was not produced by this run: stale, not evidence.
+    stamps_before = {a: artifact_stamp(cwd, a) for a in profile["artifacts"]}
     ci = ci_context(dict(os.environ))
     tool_root = Path(__file__).resolve().parent
     tool_top = recorder._git(str(tool_root), "rev-parse", "--show-toplevel")
@@ -284,7 +311,10 @@ def run(
     for number, relative in enumerate(profile["artifacts"]):
         entry: dict[str, Any] = {"source": relative}
         try:
-            data = artifact_bytes(cwd, relative)
+            data, stamp = artifact_bytes(cwd, relative)
+            if stamps_before[relative] == stamp:
+                entry["reason"] = "unchanged_since_launch"
+                raise ValueError("artifact was not written by this run")
             if total + len(data) > MAX_TOTAL_BYTES:
                 raise ValueError("session attachment budget exceeded")
             target = f"attachment-{number:02d}.bin"
@@ -309,11 +339,8 @@ def run(
         "ci": ci,
         "source_before": source_before,
         "source_after": source_after,
-        "observed_clean_checkout_unchanged": (
-            source_before == source_after
-            and source_before["worktree_clean"] is True
-            and receipt["commit"] == source_before["commit"]
-            and receipt["worktree_clean"] is True
+        "observed_clean_checkout_unchanged": observed_unchanged(
+            source_before, source_after, dict(receipt)
         ),
         "tool_source": tool_source,
         "tool_files": tool_files,
@@ -327,7 +354,7 @@ def run(
         "command_exit": command_code,
         "evidence_status": "complete" if complete else "incomplete",
         "attachments": attachments,
-        "claims": "One selected check only. No whole-repo or root-cause verdict.",
+        "claims": CLAIMS,
     }
     try:
         write_new(
@@ -346,7 +373,7 @@ def run(
 
 def verify(destination: Path) -> dict[str, Any]:
     """Re-read a local session. Integrity only, not test correctness or authorship."""
-    raw = regular_bytes(destination / "session.json", MAX_PROFILE_BYTES)
+    raw = regular_bytes(destination / "session.json", MAX_RECORD_BYTES)
     session = json.loads(raw)
     if not isinstance(session, dict) or session.get("version") != 1:
         raise ValueError("unsupported session")
@@ -359,11 +386,11 @@ def verify(destination: Path) -> dict[str, Any]:
         if binding["path"] != fixed_name:
             raise ValueError("unexpected binding path")
         if (
-            sha(regular_bytes(destination / fixed_name, MAX_PROFILE_BYTES))
+            sha(regular_bytes(destination / fixed_name, MAX_RECORD_BYTES))
             != binding["sha256"]
         ):
             raise ValueError("session binding mismatch")
-    receipt = json.loads(regular_bytes(destination / "receipt.json", MAX_PROFILE_BYTES))
+    receipt = json.loads(regular_bytes(destination / "receipt.json", MAX_RECORD_BYTES))
     if set(receipt) != recorder.RECEIPT_FIELDS or receipt["version"] != 1:
         raise ValueError("unsupported receipt")
     profile = read_profile(destination / "profile.json")
@@ -375,8 +402,26 @@ def verify(destination: Path) -> dict[str, Any]:
     ):
         raise ValueError("profile/receipt/session mismatch")
     expected_exit = command_status(receipt)
-    if session["command_exit"] != expected_exit:
+    if (
+        type(session["command_exit"]) is not int
+        or session["command_exit"] != expected_exit
+    ):
         raise ValueError("session outcome differs from receipt")
+    if session.get("claims") != CLAIMS or "session_write_failed" in session:
+        raise ValueError("session claims are not the fixed statement")
+    origin, final = session["source_before"], session["source_after"]
+    for source in (origin, final):
+        if source is not None and (
+            not isinstance(source, dict)
+            or set(source) != {"commit", "tree", "worktree_clean"}
+        ):
+            raise ValueError("invalid source observation")
+    if not isinstance(origin, dict):
+        raise ValueError("invalid source observation")
+    if session["observed_clean_checkout_unchanged"] is not observed_unchanged(
+        origin, final, receipt
+    ):
+        raise ValueError("observed checkout flag is not derivable")
     output = receipt["output"]
     if output["path"] != "receipt.json.log":
         raise ValueError("unexpected log path")
@@ -423,8 +468,14 @@ def verify(destination: Path) -> dict[str, Any]:
         total_bytes += len(data)
         if total_bytes > MAX_TOTAL_BYTES:
             raise ValueError("attachment budget exceeded")
-        if sha(data) != item["sha256"] or len(data) != item["bytes"]:
+        if (
+            sha(data) != item["sha256"]
+            or type(item["bytes"]) is not int
+            or len(data) != item["bytes"]
+        ):
             raise ValueError("attachment mismatch")
+    if session["evidence_status"] == "complete" and final is None:
+        raise ValueError("complete evidence without a final source observation")
     return session
 
 
@@ -432,7 +483,7 @@ def main() -> int:
     if len(sys.argv) == 3 and sys.argv[1] == "--verify":
         try:
             result = verify(Path(sys.argv[2]))
-        except (OSError, ValueError, KeyError, TypeError):
+        except (OSError, ValueError, KeyError, TypeError, RecursionError):
             print("Diagnostic integrity check failed.", file=sys.stderr)
             return 125
         print(json.dumps(result, indent=2))
@@ -453,7 +504,7 @@ def main() -> int:
     except recorder.Interrupted as error:
         print("Diagnostic interrupted; no completed session claimed.", file=sys.stderr)
         return 128 + error.signum
-    except (OSError, ValueError, json.JSONDecodeError):
+    except (OSError, ValueError, json.JSONDecodeError, RecursionError):
         print("Diagnostic unavailable; no completed session claimed.", file=sys.stderr)
         return 125
     print(json.dumps(session, indent=2))

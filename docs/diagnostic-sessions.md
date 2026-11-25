@@ -32,6 +32,10 @@ Exit behavior:
   command_exit=0 and evidence_status=incomplete in the session manifest.
 - Failure to start, interrupted capture or failure to create a final session
   does not claim a complete diagnostic. A missing session is not success.
+- Exit 125 is overloaded: a command that itself exits 125, a successful command
+  with incomplete evidence, and a refused or unstartable run all return it.
+  Read command_exit and evidence_status in session.json, or use --verify, to
+  tell them apart; a refused run has no session.json.
 - No timeout is added by default. An explicit finite positive --timeout uses
   the existing recorder process-group deadline and preserves its 124 outcome.
   Profiles do not silently cut off or retry an existing command.

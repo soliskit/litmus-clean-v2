@@ -2,7 +2,7 @@
   "version": 1,
   "repo": "Arx",
   "check": "web-logic",
-  "scope": "Browser logic unit tests only. No native UI, Reminders or Safari verdict.",
+  "scope": "Browser logic unit tests only. No DOM, browser, native UI, Reminders or Safari verdict.",
   "argv": [
     "node",
     "--test",

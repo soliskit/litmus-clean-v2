@@ -2,6 +2,7 @@
 
 import fcntl
 import hashlib
+import itertools
 import json
 import os
 import signal
@@ -10,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -91,8 +93,10 @@ class DiagnosticTests(unittest.TestCase):
 
     def test_native_attachment_is_copied_not_edited(self) -> None:
         original = b"native report\x00\xff"
-        (self.repo / "result.bin").write_bytes(original)
-        self.select("pass", ["result.bin"])
+        self.select(
+            f"import pathlib; pathlib.Path('result.bin').write_bytes({original!r})",
+            ["result.bin"],
+        )
         session, status = diagnostic.run(self.profile, self.repo, self.destination)
         self.assertEqual(status, 0)
         attachment = session["attachments"][0]
@@ -146,8 +150,10 @@ class DiagnosticTests(unittest.TestCase):
             diagnostic.verify(self.destination)
 
     def test_integrity_rechecks_attachment(self) -> None:
-        (self.repo / "native").write_bytes(b"original")
-        self.select("pass", ["native"])
+        self.select(
+            "import pathlib; pathlib.Path('native').write_bytes(b'original')",
+            ["native"],
+        )
         diagnostic.run(self.profile, self.repo, self.destination)
         diagnostic.verify(self.destination)
         (self.destination / "attachment-00.bin").write_bytes(b"modified")
@@ -237,9 +243,11 @@ class DiagnosticTests(unittest.TestCase):
         self.assertEqual(session["attachments"][0]["status"], "unavailable")
 
     def test_attachment_total_budget_marks_incomplete(self) -> None:
-        (self.repo / "a").write_bytes(b"123")
-        (self.repo / "b").write_bytes(b"456")
-        self.select("pass", ["a", "b"])
+        self.select(
+            "import pathlib; pathlib.Path('a').write_bytes(b'123');"
+            " pathlib.Path('b').write_bytes(b'456')",
+            ["a", "b"],
+        )
         with patch.object(diagnostic, "MAX_TOTAL_BYTES", 4):
             session, status = diagnostic.run(self.profile, self.repo, self.destination)
         self.assertEqual(status, 125)
@@ -606,6 +614,277 @@ class DiagnosticTests(unittest.TestCase):
         diagnostic.run(self.profile, self.repo, self.destination)
         receipt = json.loads((self.destination / "receipt.json").read_text())
         self.assertFalse(receipt["worktree_clean"])
+
+    def good_session(
+        self, code: str = "pass", artifacts: list[str] | None = None
+    ) -> dict[str, Any]:
+        self.select(code, artifacts)
+        session, status = diagnostic.run(self.profile, self.repo, self.destination)
+        self.assertEqual(status, 0)
+        return session
+
+    def edit_session(self, change: Callable[[dict[str, Any]], object]) -> None:
+        session = json.loads((self.destination / "session.json").read_text())
+        change(session)
+        (self.destination / "session.json").write_text(
+            json.dumps(session, indent=2) + "\n"
+        )
+
+    def test_stale_artifact_is_not_complete_evidence(self) -> None:
+        (self.repo / "report.xml").write_text("<old-run/>")
+        self.select("print('crashed before writing report')", ["report.xml"])
+        session, status = diagnostic.run(self.profile, self.repo, self.destination)
+        self.assertEqual(status, 125)
+        self.assertEqual(session["evidence_status"], "incomplete")
+        entry = session["attachments"][0]
+        self.assertEqual(entry["status"], "unavailable")
+        self.assertEqual(entry["reason"], "unchanged_since_launch")
+        self.assertEqual(diagnostic.verify(self.destination)["command_exit"], 0)
+
+    def test_artifact_rewritten_by_the_run_is_captured(self) -> None:
+        (self.repo / "report.xml").write_text("<old-run/>")
+        self.select(
+            "import pathlib; pathlib.Path('report.xml').write_text('<new-run/>')",
+            ["report.xml"],
+        )
+        session, status = diagnostic.run(self.profile, self.repo, self.destination)
+        self.assertEqual(status, 0)
+        self.assertEqual(session["evidence_status"], "complete")
+        self.assertEqual(
+            (self.destination / "attachment-00.bin").read_text(), "<new-run/>"
+        )
+
+    def test_session_with_large_argv_still_verifies(self) -> None:
+        self.profile.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "repo": "fixture",
+                    "check": "selected",
+                    "scope": "synthetic wrapper qualification, not an app check",
+                    "argv": ["true"] + ["x"] * 10000,
+                    "artifacts": [],
+                }
+            )
+        )
+        _session, status = diagnostic.run(self.profile, self.repo, self.destination)
+        self.assertEqual(status, 0)
+        self.assertGreater(len((self.destination / "receipt.json").read_bytes()), 65536)
+        self.assertEqual(diagnostic.verify(self.destination)["command_exit"], 0)
+
+    def test_cli_deeply_nested_profile_is_a_typed_failure(self) -> None:
+        self.profile.write_text("[" * 30000 + "]" * 30000)
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(Path(diagnostic.__file__)),
+                str(self.profile),
+                str(self.destination),
+                "--cwd",
+                str(self.repo),
+            ],
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 125)
+        self.assertNotIn(b"Traceback", result.stderr)
+
+    def test_cli_deeply_nested_session_is_a_typed_failure(self) -> None:
+        self.good_session()
+        (self.destination / "session.json").write_text("[" * 30000 + "]" * 30000)
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(Path(diagnostic.__file__)),
+                "--verify",
+                str(self.destination),
+            ],
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 125)
+        self.assertNotIn(b"Traceback", result.stderr)
+
+    def test_verify_rederives_session_invariants(self) -> None:
+        self.good_session()
+        original = (self.destination / "session.json").read_text()
+        edits: dict[str, Callable[[dict[str, Any]], object]] = {
+            "claims": lambda s: s.update(claims="Whole repo passed."),
+            "complete without source_after": lambda s: s.update(source_after=None),
+            "flag true while dirty": lambda s: (
+                s["source_before"].update(worktree_clean=False),
+                s["source_after"].update(worktree_clean=False),
+            ),
+            "flag flipped": lambda s: s.update(observed_clean_checkout_unchanged=False),
+            "bool command_exit": lambda s: s.update(command_exit=False),
+            "write failed flag": lambda s: s.update(session_write_failed=True),
+        }
+        for name, change in edits.items():
+            with self.subTest(name):
+                (self.destination / "session.json").write_text(original)
+                self.edit_session(change)
+                with self.assertRaises(ValueError):
+                    diagnostic.verify(self.destination)
+
+    def test_signal_killed_command_exits_128_plus_signal(self) -> None:
+        self.select("import os, signal; os.kill(os.getpid(), signal.SIGKILL)")
+        session, status = diagnostic.run(self.profile, self.repo, self.destination)
+        self.assertEqual(session["command_exit"], 128 + signal.SIGKILL)
+        self.assertEqual(status, 128 + signal.SIGKILL)
+
+    def test_verify_refuses_unavailable_evidence_labeled_complete(self) -> None:
+        self.select("pass", ["missing"])
+        diagnostic.run(self.profile, self.repo, self.destination)
+        self.edit_session(lambda s: s.update(evidence_status="complete"))
+        with self.assertRaises(ValueError):
+            diagnostic.verify(self.destination)
+
+    def test_verify_refuses_reordered_attachments_and_budget(self) -> None:
+        self.good_session(
+            "import pathlib; pathlib.Path('a').write_bytes(b'1');"
+            " pathlib.Path('b').write_bytes(b'2')",
+            ["a", "b"],
+        )
+        original = (self.destination / "session.json").read_text()
+        self.edit_session(
+            lambda s: s.update(attachments=list(reversed(s["attachments"])))
+        )
+        with self.assertRaises(ValueError):
+            diagnostic.verify(self.destination)
+        (self.destination / "session.json").write_text(original)
+        with patch.object(diagnostic, "MAX_TOTAL_BYTES", 1):
+            with self.assertRaises(ValueError):
+                diagnostic.verify(self.destination)
+
+    def test_verify_rehashes_log_of_equal_size(self) -> None:
+        self.good_session("print('observed output')")
+        log = self.destination / "receipt.json.log"
+        original = log.read_bytes()
+        log.write_bytes(b"x" * len(original))
+        with self.assertRaises(ValueError):
+            diagnostic.verify(self.destination)
+
+    def test_verify_refuses_changed_labels_scope_and_binding(self) -> None:
+        self.good_session()
+        original = (self.destination / "session.json").read_text()
+        edits: dict[str, Callable[[dict[str, Any]], object]] = {
+            "label": lambda s: s.update(repo_label="other"),
+            "check": lambda s: s.update(check="other"),
+            "scope": lambda s: s.update(scope="other"),
+            "binding path": lambda s: s["profile"].update(path="other.json"),
+            "version": lambda s: s.update(version=2),
+        }
+        for name, change in edits.items():
+            with self.subTest(name):
+                (self.destination / "session.json").write_text(original)
+                self.edit_session(change)
+                with self.assertRaises(ValueError):
+                    diagnostic.verify(self.destination)
+
+    def test_verify_refuses_receipt_with_extra_field_even_if_rehashed(self) -> None:
+        self.good_session()
+        receipt_path = self.destination / "receipt.json"
+        receipt = json.loads(receipt_path.read_text())
+        receipt["injected"] = True
+        receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
+        self.edit_session(
+            lambda s: s["receipt"].update(
+                sha256=hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+            )
+        )
+        with self.assertRaises(ValueError):
+            diagnostic.verify(self.destination)
+
+    def test_profile_limits(self) -> None:
+        base = {
+            "version": 1,
+            "repo": "fixture",
+            "check": "selected",
+            "scope": "synthetic wrapper qualification, not an app check",
+            "argv": ["true"],
+            "artifacts": [],
+        }
+        changes: tuple[Callable[[dict[str, Any]], object], ...] = (
+            lambda p: p.update(artifacts=["a", "a"]),
+            lambda p: p.update(artifacts=[f"f{n}" for n in range(33)]),
+            lambda p: p.update(argv=["", "x"]),
+        )
+        for change in changes:
+            profile = dict(base)
+            change(profile)
+            self.profile.write_text(json.dumps(profile))
+            with self.assertRaises(ValueError):
+                diagnostic.read_profile(self.profile)
+
+    def test_destination_is_private_and_session_files_are_exclusive(self) -> None:
+        self.good_session()
+        self.assertEqual(self.destination.stat().st_mode & 0o777, 0o700)
+        with self.assertRaises(FileExistsError):
+            diagnostic.write_new(self.destination / "session.json", b"again")
+
+    def test_ci_context_value_checks(self) -> None:
+        with self.assertRaises(ValueError):
+            diagnostic.ci_context({"GITHUB_ACTIONS": "true", "GITHUB_JOB": "x" * 513})
+        with self.assertRaises(ValueError):
+            diagnostic.ci_context({"GITHUB_ACTIONS": "true", "GITHUB_RUN_ATTEMPT": "0"})
+        with self.assertRaises(ValueError):
+            diagnostic.ci_context({"GITHUB_ACTIONS": "true", "GITHUB_SHA": "not-a-sha"})
+
+    def test_mirror_refuses_symlink(self) -> None:
+        target = self.root / "target.fifo"
+        os.mkfifo(target)
+        link = self.root / "link.fifo"
+        link.symlink_to(target)
+        mirror = LocalMirror(link)
+        mirror.close()
+        self.assertEqual(mirror.state, "unavailable")
+        self.assertIsNone(mirror.fd)
+
+    def test_mirror_partial_write_is_counted_as_dropped(self) -> None:
+        fifo = self.root / "live.fifo"
+        os.mkfifo(fifo)
+        reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+        self.addCleanup(os.close, reader)
+        source = self.root / "source.log"
+        total = 5 * 16384
+        source.write_bytes(b"x" * total)
+        mirror = LocalMirror(fifo)
+        self.addCleanup(mirror.close)
+        for _ in range(8):
+            mirror.drain(str(source))
+        self.assertEqual(mirror.state, "active")
+        self.assertGreater(mirror.written, 0)
+        self.assertGreater(mirror.dropped, 0)
+        self.assertEqual(mirror.written + mirror.dropped, total)
+
+    def test_mirror_refuses_foreign_owner(self) -> None:
+        fifo = self.root / "foreign.fifo"
+        os.mkfifo(fifo)
+        reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+        self.addCleanup(os.close, reader)
+        with patch("local_mirror.os.geteuid", return_value=os.geteuid() + 1):
+            mirror = LocalMirror(fifo)
+        mirror.close()
+        self.assertEqual(mirror.state, "unavailable")
+        self.assertIsNone(mirror.fd)
+
+    def test_mirror_final_drain_honors_its_deadline(self) -> None:
+        fifo = self.root / "drain.fifo"
+        os.mkfifo(fifo)
+        reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+        self.addCleanup(os.close, reader)
+        source = self.root / "big.log"
+        total = 512 * 1024
+        source.write_bytes(b"y" * total)
+        mirror = LocalMirror(fifo)
+        self.addCleanup(mirror.close)
+        # A patched clock isolates the deadline branch: with a real clock the
+        # regular-file loop ends on its byte target long before 10 ms pass.
+        with patch(
+            "local_mirror.time.monotonic", side_effect=itertools.count(0.0, 0.004)
+        ):
+            mirror.finish(str(source))
+        self.assertEqual(mirror.state, "active")
+        self.assertGreater(mirror.offset, 0)
+        self.assertLess(mirror.offset, total)
 
 
 if __name__ == "__main__":
